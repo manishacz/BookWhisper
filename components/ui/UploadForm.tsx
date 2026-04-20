@@ -1,6 +1,11 @@
 "use client";
 
 import React, { useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useUser } from "@clerk/nextjs";
+import { MAX_FILE_SIZE, ACCEPTED_PDF_TYPES } from "@/lib/constants";
+import { parsePDFFile } from "@/lib/utils";
+import { createBook, saveBookSegments } from "@/lib/actions/book.actions";
 
 const MALE_VOICES = [
     { id: "dave", name: "Dave", description: "Male voice, British. Essex, casual & conversational" },
@@ -14,6 +19,8 @@ const FEMALE_VOICES = [
 ];
 
 export default function UploadForm() {
+    const router = useRouter();
+    const { user } = useUser();
     const pdfInputRef = useRef<HTMLInputElement>(null);
     const coverInputRef = useRef<HTMLInputElement>(null);
 
@@ -24,6 +31,7 @@ export default function UploadForm() {
     const [selectedVoice, setSelectedVoice] = useState("rachel");
     const [errors, setErrors] = useState<{ pdf?: string; title?: string; author?: string }>({});
     const [submitted, setSubmitted] = useState(false);
+    const [isSynthesizing, setIsSynthesizing] = useState(false);
 
     const validate = () => {
         const newErrors: { pdf?: string; title?: string; author?: string } = {};
@@ -35,12 +43,21 @@ export default function UploadForm() {
 
     const handlePdfChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0] ?? null;
+        if (file) {
+            if (!ACCEPTED_PDF_TYPES.includes(file.type)) {
+                setErrors((prev) => ({ ...prev, pdf: "Only PDF files are allowed" }));
+                return;
+            }
+            if (file.size > MAX_FILE_SIZE) {
+                setErrors((prev) => ({ ...prev, pdf: "File size must be under 50MB" }));
+                return;
+            }
+        }
         setPdfFile(file);
         if (file && errors.pdf) {
             setErrors((prev) => ({ ...prev, pdf: undefined }));
         }
     };
-
     const handleCoverChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0] ?? null;
         setCoverFile(file);
@@ -60,7 +77,7 @@ export default function UploadForm() {
         }
     };
 
-    const handleSubmit = (e: React.FormEvent) => {
+    const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
         setSubmitted(true);
         const validationErrors = validate();
@@ -69,11 +86,123 @@ export default function UploadForm() {
             return;
         }
         setErrors({});
-        // TODO: handle form submission
-        console.log({ pdfFile, coverFile, title, author, selectedVoice });
+        setIsSynthesizing(true);
+        try {
+            if (!pdfFile) return;
+            const clerkId = user?.id;
+            if (!clerkId) throw new Error("You must be signed in to upload a book.");
+
+            // 1. Upload PDF (+ optional cover) to Vercel Blob via API route
+            const uploadForm = new FormData();
+            uploadForm.append("pdf", pdfFile);
+            uploadForm.append("title", title);
+            if (coverFile) uploadForm.append("cover", coverFile);
+
+            const uploadRes = await fetch("/api/upload", {
+                method: "POST",
+                body: uploadForm,
+            });
+            if (!uploadRes.ok) {
+                const { error } = await uploadRes.json();
+                throw new Error(error ?? "File upload failed");
+            }
+            const { pdfUrl, pdfKey, coverUrl, coverKey } = await uploadRes.json();
+
+            // 2. Parse PDF (extract text segments + auto-generate cover if none uploaded).
+            // Run BEFORE committing to any more work; clean up blobs if parsing fails.
+            let segments: Awaited<ReturnType<typeof parsePDFFile>>["content"];
+            let autoCoverDataUrl: string | null = null;
+            try {
+                const parsed = await parsePDFFile(pdfFile);
+                segments = parsed.content;
+                autoCoverDataUrl = parsed.cover ?? null;
+            } catch (parseErr) {
+                // Best-effort: delete the blobs we already uploaded to avoid orphans
+                await fetch("/api/upload/delete", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ keys: [pdfKey, coverKey].filter(Boolean) }),
+                }).catch(() => {/* best-effort */});
+                throw parseErr;
+            }
+
+            // 3. If no user-supplied cover was uploaded but the PDF parser generated a
+            //    base64 cover, upload it to Vercel Blob so Book.coverURL is a real
+            //    https:// URL (BookCard does not render data: URLs correctly).
+            let finalCoverUrl: string | null = coverUrl ?? null;
+            let finalCoverKey: string | null = coverKey ?? null;
+
+            if (!finalCoverUrl && autoCoverDataUrl) {
+                try {
+                    const dataRes = await fetch(autoCoverDataUrl);
+                    const blob = await dataRes.blob();
+                    const autoFile = new File([blob], "auto-cover.jpg", { type: blob.type || "image/jpeg" });
+
+                    const autoCoverForm = new FormData();
+                    // The upload route requires a "pdf" field — send a minimal placeholder
+                    autoCoverForm.append("pdf", new File(["%PDF"], "placeholder.pdf", { type: "application/pdf" }));
+                    autoCoverForm.append("cover", autoFile);
+                    autoCoverForm.append("title", title);
+
+                    const autoCoverRes = await fetch("/api/upload", {
+                        method: "POST",
+                        body: autoCoverForm,
+                    });
+                    if (autoCoverRes.ok) {
+                        const json = await autoCoverRes.json();
+                        finalCoverUrl = json.coverUrl ?? null;
+                        finalCoverKey = json.coverKey ?? null;
+                    }
+                } catch {
+                    // Auto-cover upload is best-effort; proceed without a cover
+                }
+            }
+
+            // 4. Create the Book record in MongoDB
+            const bookRes = await createBook({
+                clerkId,
+                title,
+                author,
+                persona: selectedVoice,
+                fileURL: pdfUrl,
+                fileBlobKey: pdfKey,
+                coverURL: finalCoverUrl ?? undefined,
+                coverBlobKey: finalCoverKey ?? undefined,
+                fileSize: pdfFile.size,
+            });
+
+            if (!bookRes.success || !bookRes.data) {
+                throw new Error(
+                    typeof bookRes.error === "string"
+                        ? bookRes.error
+                        : "Failed to create book record."
+                );
+            }
+
+            const book = bookRes.data as { _id: string; slug: string };
+
+            // 5. Save text segments — surface failures instead of silently redirecting
+            const segRes = await saveBookSegments(book._id, clerkId, segments);
+            if (!segRes.success) {
+                throw new Error(
+                    typeof segRes.error === "string"
+                        ? segRes.error
+                        : "Book was created but text segments could not be saved. Please try again."
+                );
+            }
+
+            // 6. Redirect to the home page
+            router.push(`/`);
+        } catch (err) {
+            console.error("[UploadForm] Submission error:", err);
+            alert(err instanceof Error ? err.message : "Something went wrong. Please try again.");
+        } finally {
+            setIsSynthesizing(false);
+        }
     };
 
     return (
+        <>
         <form
             onSubmit={handleSubmit}
             className="new-book-wrapper"
@@ -85,6 +214,15 @@ export default function UploadForm() {
                     className={`upload-dropzone border-2 border-dashed border-[var(--border-medium)] rounded-[10px] ${pdfFile ? "upload-dropzone-uploaded" : ""
                         }`}
                     onClick={() => pdfInputRef.current?.click()}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        pdfInputRef.current?.click();
+                      }
+                    }}
+                    tabIndex={0}
+                    role="button"
+                    aria-label="Upload PDF file"
                 >
                     <input
                         ref={pdfInputRef}
@@ -284,8 +422,8 @@ export default function UploadForm() {
                         <label
                             key={voice.id}
                             className={`voice-selector-option ${selectedVoice === voice.id
-                                    ? "voice-selector-option-selected"
-                                    : "voice-selector-option-default"
+                                ? "voice-selector-option-selected"
+                                : "voice-selector-option-default"
                                 }`}
                         >
                             <input
@@ -311,8 +449,8 @@ export default function UploadForm() {
                         <label
                             key={voice.id}
                             className={`voice-selector-option ${selectedVoice === voice.id
-                                    ? "voice-selector-option-selected"
-                                    : "voice-selector-option-default"
+                                ? "voice-selector-option-selected"
+                                : "voice-selector-option-default"
                                 }`}
                         >
                             <input
@@ -333,9 +471,88 @@ export default function UploadForm() {
             </div>
 
             {/* 6. Submit Button */}
-            <button type="submit" className="form-btn">
+            <button type="submit" className="form-btn" disabled={isSynthesizing}>
                 Begin Synthesis
             </button>
         </form>
+
+        {/* Synthesis Loading Modal */}
+        {isSynthesizing && (
+            <div
+                style={{
+                    position: "fixed",
+                    inset: 0,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    backgroundColor: "rgba(0,0,0,0.45)",
+                    backdropFilter: "blur(4px)",
+                    zIndex: 9999,
+                }}
+            >
+                <div
+                    style={{
+                        backgroundColor: "#ffffff",
+                        borderRadius: "16px",
+                        padding: "48px 40px",
+                        maxWidth: "420px",
+                        width: "90%",
+                        display: "flex",
+                        flexDirection: "column",
+                        alignItems: "center",
+                        gap: "16px",
+                        boxShadow: "0 20px 60px rgba(0,0,0,0.2)",
+                    }}
+                >
+                    {/* Spinner */}
+                    <svg
+                        style={{
+                            width: "52px",
+                            height: "52px",
+                            animation: "spin 1s linear infinite",
+                            color: "#7c5c3e",
+                        }}
+                        xmlns="http://www.w3.org/2000/svg"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                    >
+                        <circle
+                            cx="12"
+                            cy="12"
+                            r="10"
+                            stroke="currentColor"
+                            strokeWidth="2.5"
+                            strokeDasharray="31.4 62.8"
+                            strokeLinecap="round"
+                        />
+                    </svg>
+                    <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+
+                    <h2
+                        style={{
+                            fontSize: "1.375rem",
+                            fontWeight: 700,
+                            color: "#1a1a1a",
+                            textAlign: "center",
+                            margin: 0,
+                        }}
+                    >
+                        Synthesizing Your Book
+                    </h2>
+                    <p
+                        style={{
+                            fontSize: "0.95rem",
+                            color: "#6b7280",
+                            textAlign: "center",
+                            lineHeight: 1.6,
+                            margin: 0,
+                        }}
+                    >
+                        Please wait while we process your PDF and prepare your interactive literary experience.
+                    </p>
+                </div>
+            </div>
+        )}
+        </>
     );
 }
