@@ -108,10 +108,57 @@ export default function UploadForm() {
             }
             const { pdfUrl, pdfKey, coverUrl, coverKey } = await uploadRes.json();
 
-            // 2. Parse PDF (extract text segments + auto-generate cover if none uploaded)
-            const { content: segments, cover: autoCoverDataUrl } = await parsePDFFile(pdfFile);
+            // 2. Parse PDF (extract text segments + auto-generate cover if none uploaded).
+            // Run BEFORE committing to any more work; clean up blobs if parsing fails.
+            let segments: Awaited<ReturnType<typeof parsePDFFile>>["content"];
+            let autoCoverDataUrl: string | null = null;
+            try {
+                const parsed = await parsePDFFile(pdfFile);
+                segments = parsed.content;
+                autoCoverDataUrl = parsed.cover ?? null;
+            } catch (parseErr) {
+                // Best-effort: delete the blobs we already uploaded to avoid orphans
+                await fetch("/api/upload/delete", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ keys: [pdfKey, coverKey].filter(Boolean) }),
+                }).catch(() => {/* best-effort */});
+                throw parseErr;
+            }
 
-            // 3. Create the Book record in MongoDB
+            // 3. If no user-supplied cover was uploaded but the PDF parser generated a
+            //    base64 cover, upload it to Vercel Blob so Book.coverURL is a real
+            //    https:// URL (BookCard does not render data: URLs correctly).
+            let finalCoverUrl: string | null = coverUrl ?? null;
+            let finalCoverKey: string | null = coverKey ?? null;
+
+            if (!finalCoverUrl && autoCoverDataUrl) {
+                try {
+                    const dataRes = await fetch(autoCoverDataUrl);
+                    const blob = await dataRes.blob();
+                    const autoFile = new File([blob], "auto-cover.jpg", { type: blob.type || "image/jpeg" });
+
+                    const autoCoverForm = new FormData();
+                    // The upload route requires a "pdf" field — send a minimal placeholder
+                    autoCoverForm.append("pdf", new File(["%PDF"], "placeholder.pdf", { type: "application/pdf" }));
+                    autoCoverForm.append("cover", autoFile);
+                    autoCoverForm.append("title", title);
+
+                    const autoCoverRes = await fetch("/api/upload", {
+                        method: "POST",
+                        body: autoCoverForm,
+                    });
+                    if (autoCoverRes.ok) {
+                        const json = await autoCoverRes.json();
+                        finalCoverUrl = json.coverUrl ?? null;
+                        finalCoverKey = json.coverKey ?? null;
+                    }
+                } catch {
+                    // Auto-cover upload is best-effort; proceed without a cover
+                }
+            }
+
+            // 4. Create the Book record in MongoDB
             const bookRes = await createBook({
                 clerkId,
                 title,
@@ -119,8 +166,8 @@ export default function UploadForm() {
                 persona: selectedVoice,
                 fileURL: pdfUrl,
                 fileBlobKey: pdfKey,
-                coverURL: coverUrl ?? autoCoverDataUrl,
-                coverBlobKey: coverKey ?? undefined,
+                coverURL: finalCoverUrl ?? undefined,
+                coverBlobKey: finalCoverKey ?? undefined,
                 fileSize: pdfFile.size,
             });
 
@@ -134,10 +181,17 @@ export default function UploadForm() {
 
             const book = bookRes.data as { _id: string; slug: string };
 
-            // 4. Save text segments for search/conversation
-            await saveBookSegments(book._id, clerkId, segments);
+            // 5. Save text segments — surface failures instead of silently redirecting
+            const segRes = await saveBookSegments(book._id, clerkId, segments);
+            if (!segRes.success) {
+                throw new Error(
+                    typeof segRes.error === "string"
+                        ? segRes.error
+                        : "Book was created but text segments could not be saved. Please try again."
+                );
+            }
 
-            // 5. Redirect to the home page
+            // 6. Redirect to the home page
             router.push(`/`);
         } catch (err) {
             console.error("[UploadForm] Submission error:", err);

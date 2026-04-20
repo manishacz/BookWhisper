@@ -5,10 +5,22 @@ import { generateSlug } from "@/lib/utils";
 
 export const runtime = "nodejs";
 
-// Increase body size limit to 55 MB to accommodate large PDFs
-export const maxDuration = 60; // seconds
+// Maximum serverless execution time (seconds) — does NOT control request body size
+export const maxDuration = 60;
+
+// 55 MB hard cap for incoming uploads
+const MAX_UPLOAD_BYTES = 55 * 1024 * 1024;
 
 export async function POST(req: NextRequest) {
+    // Enforce upload size limit before reading the body
+    const contentLength = req.headers.get("content-length");
+    if (contentLength !== null && parseInt(contentLength, 10) > MAX_UPLOAD_BYTES) {
+        return NextResponse.json(
+            { error: "Upload exceeds the 55 MB size limit" },
+            { status: 413 }
+        );
+    }
+
     try {
         // Require authentication
         const { userId } = await auth();

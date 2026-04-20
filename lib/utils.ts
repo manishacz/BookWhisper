@@ -13,13 +13,16 @@ export const serializeData = <T>(data: T): T => JSON.parse(JSON.stringify(data))
 
 // Auto generate slug
 export function generateSlug(text: string): string {
-  return text
-      .replace(/\.[^/.]+$/, '') // Remove file extension (.pdf, .txt, etc.)
-      .toLowerCase() // Convert to lowercase
-      .trim() // Remove whitespace from both ends
-      .replace(/[^\w\s-]/g, '') // Remove special characters (keep letters, numbers, spaces, hyphens)
-      .replace(/[\s_]+/g, '-') // Replace spaces and underscores with hyphens
-      .replace(/^-+|-+$/g, ''); // Remove leading/trailing hyphens
+  const slug = text
+      .replace(/\.[^/.]+$/, '')
+      .normalize('NFKD')
+      .replace(/\p{Diacritic}/gu, '')
+      .toLowerCase()
+      .trim()
+      .replace(/[^\p{L}\p{N}\s-]/gu, '')
+      .replace(/[\s_]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+   return slug || 'untitled';
 }
 
 // Escape regex special characters to prevent ReDoS attacks
@@ -123,6 +126,7 @@ export async function parsePDFFile(file: File) {
 
     await firstPage.render({
       canvasContext: context,
+      canvas,
       viewport: viewport,
     }).promise;
 

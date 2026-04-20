@@ -1,14 +1,15 @@
 import React from 'react'
+import { auth } from '@clerk/nextjs/server'
 import HeroSection from '@/components/ui/HeroSection'
 import { BookCard } from '@/components/ui/BookCard'
 import { getAllBooks } from '@/lib/actions/book.actions'
 
-// Revalidate once per minute so newly-uploaded books appear quickly
-// without requiring a full rebuild.
-export const revalidate = 60;
+// Run dynamically so every request fetches the current user's own library
+export const dynamic = 'force-dynamic';
 
 const Page = async () => {
-  const result = await getAllBooks();
+  const { userId } = await auth();
+  const result = await getAllBooks(undefined, userId ?? undefined);
   const books: Array<{ _id: string; title: string; author: string; coverURL: string; slug: string }> =
     result.success && Array.isArray(result.data) ? result.data : [];
 
@@ -34,7 +35,7 @@ const Page = async () => {
           </svg>
           <h2 className="text-xl font-semibold text-[var(--text-primary)]">Your library is empty</h2>
           <p className="text-sm text-[var(--text-secondary)] max-w-xs">
-            Upload your first book using the &ldquo;New Book&rdquo; button to start your interactive literary journey.
+            Upload your first book using the &ldquo;Add New&rdquo; button to start your interactive literary journey.
           </p>
         </div>
       ) : (

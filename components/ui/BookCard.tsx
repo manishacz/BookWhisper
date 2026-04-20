@@ -12,7 +12,10 @@ const PLACEHOLDER_COVER = `data:image/svg+xml;utf8,${encodeURIComponent(`
 </svg>`)}`;
 
 export const BookCard = ({ title, author, coverURL, slug }: BookCardProps) => {
-  const src = coverURL && coverURL.startsWith('http') ? coverURL : PLACEHOLDER_COVER;
+  const isValidSrc =
+    !!coverURL &&
+    (coverURL.startsWith('http') || coverURL.startsWith('data:') || coverURL.startsWith('/'));
+  const src = isValidSrc ? coverURL : PLACEHOLDER_COVER;
 
   return (
     <Link href={`/books/${slug}`}>

@@ -8,21 +8,33 @@ import BookSegment from "@/database/models/book-segment.model";
 import mongoose from "mongoose";
 import {getUserPlan} from "@/lib/subscription.server";
 
-export const getAllBooks = async (search?: string) => {
+export const getAllBooks = async (search?: string, clerkId?: string) => {
     try {
         await connectToDatabase();
 
-        let query = {};
+        // Scope to the authenticated user when a clerkId is provided
+        const baseFilter: Record<string, unknown> = clerkId ? { clerkId } : {};
 
+        const { auth } = await import("@clerk/nextjs/server");
+        const { userId } = await auth();
+        if (!userId) return { success: false, error: "Unauthorized" };
+
+        const query: Record<string, unknown> = { clerkId: userId };
         if (search) {
             const escapedSearch = escapeRegex(search);
             const regex = new RegExp(escapedSearch, 'i');
-            query = {
-                $or: [
-                    { title: { $regex: regex } },
-                    { author: { $regex: regex } },
-                ]
-            };
+             query.$or = [
+                { title: { $regex: regex } },
+                { author: { $regex: regex } },
+            ];
+            // Merge user scope with search so both filters apply
+            // const searchFilter = {
+            //     $or: [
+            //         { title: { $regex: regex } },
+            //         { author: { $regex: regex } },
+            //     ],
+            // };
+            // query = clerkId ? { $and: [baseFilter, searchFilter] } : searchFilter;
         }
 
         const books = await Book.find(query).sort({ createdAt: -1 }).lean();
@@ -34,7 +46,7 @@ export const getAllBooks = async (search?: string) => {
     } catch (e) {
         console.error('Error connecting to database', e);
         return {
-            success: false, error: e
+            success: false, error: e instanceof Error ? e.message : String(e)
         }
     }
 }
@@ -60,36 +72,37 @@ export const checkBookExists = async (title: string) => {
     } catch (e) {
         console.error('Error checking book exists', e);
         return {
-            exists: false, error: e
+            exists: false, error: e instanceof Error ? e.message : String(e)
         }
     }
 }
 
 export const createBook = async (data: CreateBook) => {
+    // Auth must be verified before any DB work
+    const { auth } = await import("@clerk/nextjs/server");
+    const { userId } = await auth();
+
+    if (!userId || userId !== data.clerkId) {
+        return { success: false, error: "Unauthorized" };
+    }
+
     try {
         await connectToDatabase();
 
+        const { getUserPlan } = await import("@/lib/subscription.server");
+        const { PLAN_LIMITS } = await import("@/lib/subscription-constants");
+
         const slug = generateSlug(data.title);
 
-        const existingBook = await Book.findOne({slug}).lean();
+        // Slug uniqueness is scoped per-user, not globally
+        const existingBook = await Book.findOne({ slug, clerkId: userId }).lean();
 
-        if(existingBook) {
+        if (existingBook) {
             return {
                 success: true,
                 data: serializeData(existingBook),
                 alreadyExists: true,
-            }
-        }
-
-        // Todo: Check subscription limits before creating a book
-        const { getUserPlan } = await import("@/lib/subscription.server");
-        const { PLAN_LIMITS } = await import("@/lib/subscription-constants");
-
-        const { auth } = await import("@clerk/nextjs/server");
-        const { userId } = await auth();
-
-        if (!userId || userId !== data.clerkId) {
-            return { success: false, error: "Unauthorized" };
+            };
         }
 
         const plan = await getUserPlan();
@@ -98,9 +111,6 @@ export const createBook = async (data: CreateBook) => {
         const bookCount = await Book.countDocuments({ clerkId: userId });
 
         if (bookCount >= limits.maxBooks) {
-            const { revalidatePath } = await import("next/cache");
-            revalidatePath("/");
-
             return {
                 success: false,
                 error: `You have reached the maximum number of books allowed for your ${plan} plan (${limits.maxBooks}). Please upgrade to add more books.`,
@@ -108,7 +118,7 @@ export const createBook = async (data: CreateBook) => {
             };
         }
 
-        const book = await Book.create({...data, clerkId: userId, slug, totalSegments: 0});
+        const book = await Book.create({ ...data, clerkId: userId, slug, totalSegments: 0 });
 
         // Invalidate home page cache so the new book shows up immediately
         const { revalidatePath } = await import('next/cache');
@@ -117,22 +127,38 @@ export const createBook = async (data: CreateBook) => {
         return {
             success: true,
             data: serializeData(book),
+        };
+    } catch (e: unknown) {
+        // Handle MongoDB duplicate-key error (E11000) gracefully
+        if (
+            typeof e === 'object' &&
+            e !== null &&
+            'code' in e &&
+            (e as { code: number }).code === 11000
+        ) {
+            const dup = await Book.findOne({ slug: generateSlug(data.title), clerkId: userId }).lean();
+            return {
+                success: true,
+                data: dup ? serializeData(dup) : null,
+                alreadyExists: true,
+            };
         }
-    } catch (e) {
-        console.error('Error creating a book', e);
 
+        console.error('Error creating a book', e);
         return {
             success: false,
-            error: e,
-        }
+            error: e instanceof Error ? e.message : String(e),
+        };
     }
 }
 
 export const getBookBySlug = async (slug: string) => {
     try {
         await connectToDatabase();
-
-        const book = await Book.findOne({ slug }).lean();
+        const { auth } = await import("@clerk/nextjs/server");
+        const { userId } = await auth();
+        if (!userId) return { success: false, error: 'Unauthorized' };
+        const book = await Book.findOne({ slug, clerkId: userId }).lean();
 
         if (!book) {
             return { success: false, error: 'Book not found' };
@@ -145,12 +171,13 @@ export const getBookBySlug = async (slug: string) => {
     } catch (e) {
         console.error('Error fetching book by slug', e);
         return {
-            success: false, error: e
+            success: false, error: e instanceof Error ? e.message : String(e)
         }
     }
 }
 
 export const saveBookSegments = async (bookId: string, clerkId: string, segments: TextSegment[]) => {
+    const session = await mongoose.startSession();
     try {
         await connectToDatabase();
 
@@ -160,23 +187,38 @@ export const saveBookSegments = async (bookId: string, clerkId: string, segments
             clerkId, bookId, content: text, segmentIndex, pageNumber, wordCount
         }));
 
-        await BookSegment.insertMany(segmentsToInsert);
+        let insertedCount = 0;
 
-        await Book.findByIdAndUpdate(bookId, { totalSegments: segments.length });
+        await session.withTransaction(async () => {
+            const result = await BookSegment.insertMany(segmentsToInsert, {
+                session,
+                ordered: false,
+                rawResult: true,
+            });
+            insertedCount = result.insertedCount ?? segmentsToInsert.length;
 
-        console.log('Book segments saved successfully.');
+            await Book.findByIdAndUpdate(
+                bookId,
+                { $inc: { totalSegments: insertedCount } },
+                { session }
+            );
+        });
+
+        console.log(`Book segments saved successfully. Inserted: ${insertedCount}`);
 
         return {
             success: true,
-            data: { segmentsCreated: segments.length}
-        }
+            data: { segmentsCreated: insertedCount },
+        };
     } catch (e) {
         console.error('Error saving book segments', e);
 
         return {
             success: false,
-            error: e,
-        }
+            error: e instanceof Error ? e.message : String(e),
+        };
+    } finally {
+        session.endSession();
     }
 }
 
@@ -200,8 +242,8 @@ export const searchBookSegments = async (bookId: string, query: string, limit: n
                 .sort({ score: { $meta: 'textScore' } })
                 .limit(limit)
                 .lean();
-        } catch {
-            // Text index may not exist — fall through to regex fallback
+        } catch (e) {
+            console.warn('Text search failed, falling back to regex:', e);
             segments = [];
         }
 

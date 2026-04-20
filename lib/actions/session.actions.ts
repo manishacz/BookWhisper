@@ -3,10 +3,15 @@
 import {EndSessionResult, StartSessionResult} from "@/types";
 import {connectToDatabase} from "@/database/mongoose";
 import VoiceSession from "@/database/models/voice-session.model";
+import { auth } from "@clerk/nextjs/server";
 import {getCurrentBillingPeriodStart} from "@/lib/subscription-constants";
 
 export const startVoiceSession = async (clerkId: string, bookId: string): Promise<StartSessionResult> => {
     try {
+         const { userId: clerkId } = await auth();
+         if (!clerkId) {
+             return { success: false, error: 'Unauthorized' };
+         }
         await connectToDatabase();
 
         // Limits/Plan to see whether a session is allowed.
@@ -54,12 +59,14 @@ export const startVoiceSession = async (clerkId: string, bookId: string): Promis
 
 export const endVoiceSession = async (sessionId: string, durationSeconds: number): Promise<EndSessionResult> => {
     try {
+        const { userId: clerkId } = await auth();
+        if (!clerkId) return { success: false, error: 'Unauthorized' };
         await connectToDatabase();
 
-        const result = await VoiceSession.findByIdAndUpdate(sessionId, {
-            endedAt: new Date(),
-            durationSeconds,
-        });
+        const result = await VoiceSession.findOneAndUpdate(
+            { _id: sessionId, clerkId },
+            { endedAt: new Date(), durationSeconds },
+        );
 
         if(!result) return { success: false, error: 'Voice session not found.' }
 
