@@ -1,20 +1,19 @@
 'use server';
 
-import {EndSessionResult, StartSessionResult} from "@/types";
-import {connectToDatabase} from "@/database/mongoose";
+import { EndSessionResult, StartSessionResult } from "@/types";
+import { connectToDatabase } from "@/database/mongoose";
 import VoiceSession from "@/database/models/voice-session.model";
 import { auth } from "@clerk/nextjs/server";
-import {getCurrentBillingPeriodStart} from "@/lib/subscription-constants";
 
-export const startVoiceSession = async (clerkId: string, bookId: string): Promise<StartSessionResult> => {
+export const startVoiceSession = async (bookId: string): Promise<StartSessionResult> => {
     try {
-         const { userId: clerkId } = await auth();
-         if (!clerkId) {
-             return { success: false, error: 'Unauthorized' };
-         }
+        const { userId } = await auth();
+        if (!userId) {
+            return { success: false, error: 'Unauthorized' };
+        }
         await connectToDatabase();
 
-        // Limits/Plan to see whether a session is allowed.
+        // Resolve plan limits and billing window
         const { getUserPlan } = await import("@/lib/subscription.server");
         const { PLAN_LIMITS, getCurrentBillingPeriodStart } = await import("@/lib/subscription-constants");
 
@@ -22,15 +21,13 @@ export const startVoiceSession = async (clerkId: string, bookId: string): Promis
         const limits = PLAN_LIMITS[plan];
         const billingPeriodStart = getCurrentBillingPeriodStart();
 
+        // Use $gte range so the query is robust regardless of how Date objects are constructed
         const sessionCount = await VoiceSession.countDocuments({
-            clerkId,
-            billingPeriodStart
+            clerkId: userId,
+            startedAt: { $gte: billingPeriodStart },
         });
 
-        if (sessionCount >= limits.maxSessionsPerMonth) {
-            const { revalidatePath } = await import("next/cache");
-            revalidatePath("/");
-
+        if (limits.maxSessionsPerMonth !== Infinity && sessionCount >= limits.maxSessionsPerMonth) {
             return {
                 success: false,
                 error: `You have reached the monthly session limit for your ${plan} plan (${limits.maxSessionsPerMonth}). Please upgrade for more sessions.`,
@@ -39,7 +36,7 @@ export const startVoiceSession = async (clerkId: string, bookId: string): Promis
         }
 
         const session = await VoiceSession.create({
-            clerkId,
+            clerkId: userId,
             bookId,
             startedAt: new Date(),
             billingPeriodStart,
@@ -50,10 +47,10 @@ export const startVoiceSession = async (clerkId: string, bookId: string): Promis
             success: true,
             sessionId: session._id.toString(),
             maxDurationMinutes: limits.maxDurationPerSession,
-        }
+        };
     } catch (e) {
         console.error('Error starting voice session', e);
-        return { success: false, error: 'Failed to start voice session. Please try again later.' }
+        return { success: false, error: 'Failed to start voice session. Please try again later.' };
     }
 }
 

@@ -65,6 +65,14 @@ export function useVapi(book: IBook) {
 
     // Set up Vapi event listeners
     useEffect(() => {
+        let vapiInstance: InstanceType<typeof Vapi>;
+        try {
+            vapiInstance = getVapi();
+        } catch (error) {
+            setLimitError(error instanceof Error ? error.message : 'Failed to initialize Vapi');
+            return;
+        }
+
         const handlers = {
             'call-start': () => {
                 isStoppingRef.current = false;
@@ -82,12 +90,19 @@ export function useVapi(book: IBook) {
 
                         // Check duration limit
                         if (newDuration >= maxDurationRef.current) {
-                            getVapi().stop();
-                            setLimitError(
-                                `Session time limit (${Math.floor(
-                                    maxDurationRef.current / SECONDS_PER_MINUTE,
-                                )} minutes) reached. Upgrade your plan for longer sessions.`,
-                            );
+                            if (timerRef.current) {
+                                clearInterval(timerRef.current);
+                                timerRef.current = null;
+                            }
+                            if (!isStoppingRef.current) {
+                                isStoppingRef.current = true;
+                                getVapi().stop();
+                                setLimitError(
+                                    `Session time limit (${Math.floor(
+                                        maxDurationRef.current / SECONDS_PER_MINUTE,
+                                    )} minutes) reached. Upgrade your plan for longer sessions.`,
+                                );
+                            }
                         }
                     }
                 }, TIMER_INTERVAL_MS);
@@ -95,7 +110,9 @@ export function useVapi(book: IBook) {
 
             'call-end': () => {
                 // Don't reset isStoppingRef here - delayed events may still fire
-                setStatus('idle');
+                if (!isStoppingRef.current) {
+                    setStatus('idle');
+                }
                 setCurrentMessage('');
                 setCurrentUserMessage('');
 
@@ -207,13 +224,13 @@ export function useVapi(book: IBook) {
 
         // Register all handlers
         Object.entries(handlers).forEach(([event, handler]) => {
-            getVapi().on(event as keyof typeof handlers, handler as () => void);
+            vapiInstance.on(event as keyof typeof handlers, handler as () => void);
         });
 
         return () => {
             // End active session on unmount
             if (sessionIdRef.current) {
-                getVapi().stop();
+                vapiInstance.stop();
                 endVoiceSession(sessionIdRef.current, durationRef.current).catch((err) =>
                     console.error('Failed to end voice session on unmount:', err),
                 );
@@ -221,7 +238,7 @@ export function useVapi(book: IBook) {
             }
             // Cleanup handlers
             Object.entries(handlers).forEach(([event, handler]) => {
-                getVapi().off(event as keyof typeof handlers, handler as () => void);
+                vapiInstance.off(event as keyof typeof handlers, handler as () => void);
             });
             if (timerRef.current) clearInterval(timerRef.current);
         };
@@ -239,7 +256,7 @@ export function useVapi(book: IBook) {
 
         try {
             // Check session limits and create session record
-            const result = await startVoiceSession(userId, book._id);
+            const result = await startVoiceSession(book._id);
 
             if (!result.success) {
                 setLimitError(result.error || 'Session limit reached. Please upgrade your plan.');
