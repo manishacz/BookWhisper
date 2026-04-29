@@ -1,7 +1,7 @@
 import React from 'react'
 import { auth } from '@clerk/nextjs/server'
-import HeroSection from '@/components/ui/HeroSection'
-import { BookCard } from '@/components/ui/BookCard'
+import HeroSection from '@/components/HeroSection'
+import { BookCard } from '@/components/BookCard'
 import { getAllBooks } from '@/lib/actions/book.actions'
 
 // Run dynamically so every request fetches the current user's own library
